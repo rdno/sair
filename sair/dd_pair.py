@@ -4,9 +4,6 @@
 from __future__ import division, absolute_import
 from __future__ import print_function, unicode_literals
 
-from pytomo3d.doubledifference import pairing
-from pytomo3d.doubledifference import utils as pair_utils
-
 import argparse
 
 import numpy as np
@@ -16,6 +13,70 @@ from . import utils
 from . import io_utils as io
 from . import mpi
 from functools import partial
+from itertools import combinations
+from collections import Counter
+
+
+def deconstruct_winname(winname):
+    """Deconstruct window name to important bits
+
+    :param winname: window name string (e.g. net.sta.loc.comp:winid)
+    :type winname: str
+    :returns: (net.sta, net.sta.loc.comp, winid)
+    :rtype: tuple
+
+    """
+    compname, win_id = winname.split(":")
+    staname = ".".join(compname.split(".")[:2])
+    return staname, compname, int(win_id)
+
+
+def get_stanames_of_pair(pair):
+    """Extract station names from pair object
+
+    :param pair: pair dict which contains window_id_i and window_id_j keys.
+    :type pair: dict
+    :returns: station names of the pair
+    :rtype: tuple
+
+    """
+    sta_i, _, _ = deconstruct_winname(pair["window_id_i"])
+    sta_j, _, _ = deconstruct_winname(pair["window_id_j"])
+    return sta_i, sta_j
+
+
+def find_weights(pairs):
+    for comp, comp_pairs in pairs.items():
+        all_paired_windows = []
+        for pair in comp_pairs:
+            all_paired_windows.append(pair["window_id_i"])
+            all_paired_windows.append(pair["window_id_j"])
+        counts = Counter(all_paired_windows)
+        for pair in comp_pairs:
+            w_i = 1/(counts[pair["window_id_i"]] + 1)
+            w_j = 1/(counts[pair["window_id_j"]] + 1)
+            pair["weight_i"] = w_i
+            pair["weight_j"] = w_j
+
+
+def _reduce_pairs(pairing_func, pairing_key, old_pairs=None,
+                  allow_self_pairing=False):
+    # General function for pairing
+    # It reduces pairs to ones which satisfies pairing_func
+    pairs = {}
+    for comp, comp_pairs in old_pairs.items():
+        pairs[comp] = []
+        for pair in comp_pairs:
+            sta_i, sta_j = get_stanames_of_pair(pair)
+            # Do not pair the station with itself
+            if allow_self_pairing or sta_i != sta_j:
+                pair_value, is_paired = pairing_func(pair["window_id_i"],
+                                                     pair["window_id_j"])
+                if is_paired:
+                    new_pair = pair.copy()
+                    new_pair[pairing_key] = pair_value
+                    pairs[comp].append(new_pair)
+    return pairs
 
 
 def pair_from_current_events(pair, events):
@@ -52,8 +113,8 @@ def close_pairs(stations, threshold, old_pairs):
         is_paired = distance < threshold
         return distance, is_paired
 
-    return pairing._reduce_pairs(pair_by_distance, "distance", old_pairs,
-                                 allow_self_pairing=True)
+    return _reduce_pairs(pair_by_distance, "distance", old_pairs,
+                         allow_self_pairing=True)
 
 
 def event_pairs(allow_event_pairing, allow_cross_pairing, allow_rec_pairing,
@@ -75,14 +136,14 @@ def event_pairs(allow_event_pairing, allow_cross_pairing, allow_rec_pairing,
                 return "Different Event Different Station", False
         else:
             return "Different Event Not Allowed", False
-    return pairing._reduce_pairs(pair_by_events, "event", old_pairs,
-                                 allow_self_pairing=True)
+    return _reduce_pairs(pair_by_events, "event", old_pairs,
+                         allow_self_pairing=True)
 
 
 def close_event_pairs(event_locations, threshold, old_pairs):
     def pair_by_event_closeness(pair_i, pair_j):
-        _, comp_i, _ = pair_utils.deconstruct_winname(pair_i)
-        _, comp_j, _ = pair_utils.deconstruct_winname(pair_j)
+        _, comp_i, _ = deconstruct_winname(pair_i)
+        _, comp_j, _ = deconstruct_winname(pair_j)
         net_i, sta_i, _, ev_i = comp_i.split(".")
         net_j, sta_j, _, ev_j = comp_j.split(".")
         if ev_i == ev_j:
@@ -92,15 +153,15 @@ def close_event_pairs(event_locations, threshold, old_pairs):
             loc_j = event_locations[ev_j]
             dist = get_distance(loc_i, loc_j)
             return dist, dist < threshold
-    return pairing._reduce_pairs(pair_by_event_closeness,
-                                 "event_dist", old_pairs,
-                                 allow_self_pairing=True)
+    return _reduce_pairs(pair_by_event_closeness,
+                         "event_dist", old_pairs,
+                         allow_self_pairing=True)
 
 
 def azimuth_pairs(event_locs, station_locs, threshold, old_pairs):
     def pair_by_azimuth(pair_i, pair_j):
-        sta_i, comp_i, _ = pair_utils.deconstruct_winname(pair_i)
-        sta_j, comp_j, _ = pair_utils.deconstruct_winname(pair_j)
+        sta_i, comp_i, _ = deconstruct_winname(pair_i)
+        sta_j, comp_j, _ = deconstruct_winname(pair_j)
         _, _, _, ev_i = comp_i.split(".")
         _, _, _, ev_j = comp_j.split(".")
         if ev_i == ev_j:
@@ -113,8 +174,8 @@ def azimuth_pairs(event_locs, station_locs, threshold, old_pairs):
             return az_diff, az_diff < threshold
         else:  # Can be implemented later
             return -1, None
-    return pairing._reduce_pairs(pair_by_azimuth, "azimuth_diff", old_pairs,
-                                 allow_self_pairing=True)
+    return _reduce_pairs(pair_by_azimuth, "azimuth_diff", old_pairs,
+                         allow_self_pairing=True)
 
 
 def similar_wf_pairs(data, threshold, old_pairs):
@@ -140,7 +201,7 @@ def similar_wf_pairs(data, threshold, old_pairs):
         is_paired = diff > threshold
         return diff, is_paired
 
-    return pairing._reduce_pairs(pair_by_similarity, "similarity", old_pairs)
+    return _reduce_pairs(pair_by_similarity, "similarity", old_pairs)
 
 
 def read_windows(event, conf, windows):
@@ -171,7 +232,7 @@ def write_pairs_for_event(event, conf):
                                  with_comps=True)
 
     print("{} Creating all pairs...".format(event))
-    pairs = pairing.create_all_pairs(windows)
+    pairs = create_all_pairs(windows)
     if conf.dd.event_pairing:
         print("{} Creating event pairs...".format(event))
         pairs = event_pairs(
@@ -215,8 +276,8 @@ def write_pairs_for_event(event, conf):
         else:
             raise Exception("Not a valid seismogram format: {}".format(
                 conf.simulation.seismogram_format))
-        pairs = pairing.similar_pairs(data, conf.dd.similarity_threshold,
-                                      pairs, allow_self_pairing=True)
+        pairs = similar_pairs(data, conf.dd.similarity_threshold,
+                              pairs, allow_self_pairing=True)
 
     if isinstance(event, list):
         utils.write_json(conf.root_work_dir / "pairs.json", pairs)
@@ -224,6 +285,50 @@ def write_pairs_for_event(event, conf):
         print("{} Writing...".format(event))
         utils.write_json(event_pairs_file.format(event), pairs)
     return {}
+
+
+def create_all_pairs(windows):
+    """Create all possible pairs from windows
+
+    :param windows: component based windows data
+    :type windows: dict
+    :returns: pairs
+    :rtype: dict
+
+    """
+    pairs = {}
+    for comp, comp_windows in windows.items():
+        pairs[comp] = [{"window_id_i": i,
+                        "window_id_j": j}
+                       for i, j in combinations(list(comp_windows.keys()), 2)]
+    return pairs
+
+
+def similar_pairs(data, threshold, old_pairs,
+                  allow_self_pairing=False):
+    """Pair the data using cc similarity
+
+    :param data: windowed data
+    :type data: station
+    :param threshold: threshold cc value
+    :type threshold: float
+    :param old_pairs: previous pairs
+    :type old_pairs: dict
+    :returns: pairs
+    :rtype: dict
+
+    """
+
+    def pair_by_similarity(pair_i, pair_j):
+        data_i = data[pair_i]
+        data_j = data[pair_j]
+        corr = np.correlate(data_i, data_j, "full")
+        ratio = max(corr)/np.sqrt(sum(data_i**2)*sum(data_j**2))
+        is_paired = abs(ratio) > threshold
+        return ratio, is_paired
+
+    return _reduce_pairs(pair_by_similarity, "cc_similarity", old_pairs,
+                         allow_self_pairing=False)
 
 
 def main():
@@ -258,7 +363,7 @@ def main():
                 pairs[comp] = pairs[comp] + ind_pairs[comp]
             io.remove_file(event_pairs_file.format(event))
         print("Finding Weights")
-        pairing.find_weights(pairs)
+        find_weights(pairs)
         utils.write_json(pairs_file, pairs)
 
     if not conf.dd.event_pairing:
@@ -266,7 +371,7 @@ def main():
         mpi.run_on_main_rank(combine)
     else:
         pairs = utils.load_json(pairs_file)
-        pairing.find_weights(pairs)
+        find_weights(pairs)
         utils.write_json(pairs_file, pairs)
 
 
